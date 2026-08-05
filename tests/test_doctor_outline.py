@@ -41,24 +41,80 @@ def test_outline_reports_tags_and_attributes(tmp_path):
     assert "RecordFrame" in outline["tags"]["Item"]["attrs"]
 
 
-def test_outline_of_a_missing_member_is_empty(tmp_path):
+def test_outline_of_a_missing_member_says_so(tmp_path):
+    """Absent must not look the same as "has no structure"."""
+
     target = make_export(tmp_path / "LUGANG.drp")
 
-    assert _xml_outline(target, "SeqContainer/nope.xml") == {}
+    outline = _xml_outline(target, "SeqContainer/nope.xml")
+
+    assert outline["error"]
+    assert not outline.get("tags")
 
 
-def test_outline_survives_a_truncated_member(tmp_path, monkeypatch):
-    """A cap on how much is read must produce a partial map, not an exception."""
+def test_element_text_is_captured():
+    """Resolve puts its values in element text, not in attributes.
 
+    A real timeline stores <MediaFilePath>D:\\...</MediaFilePath>; only DbId is
+    an attribute. An outline of attributes alone described almost nothing.
+    """
+
+    import zipfile as zf
+    import tempfile
+    from pathlib import Path as P
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = P(tmp) / "t.drp"
+        with zf.ZipFile(target, "w") as archive:
+            archive.writestr(
+                "SeqContainer/x.xml",
+                "<Sm2SequenceContainer DbId='cf2d'>"
+                "<Sm2TiVideoClip DbId='d1c2'>"
+                "<Name>C6343.MP4</Name>"
+                "<MediaFilePath>D:\\Footage\\C6343.MP4</MediaFilePath>"
+                "<MediaReelNumber>A001</MediaReelNumber>"
+                "<Start>108311</Start>"
+                "</Sm2TiVideoClip></Sm2SequenceContainer>",
+            )
+
+        outline = _xml_outline(target, "SeqContainer/x.xml")
+
+    assert outline["tags"]["MediaFilePath"]["text"] == ["D:\\Footage\\C6343.MP4"]
+    assert outline["tags"]["Name"]["text"] == ["C6343.MP4"]
+    assert outline["tags"]["Sm2TiVideoClip"]["attrs"]["DbId"] == ["d1c2"]
+
+
+def test_malformed_tail_keeps_what_was_already_parsed(tmp_path):
+    """The bug that made a real report show "0 tags" for almost every member.
+
+    Draining the event queue with list() discards every event when the final one
+    raises, turning "the tail is malformed" into "this file has no structure".
+    """
+
+    target = tmp_path / "broken.drp"
+    with zipfile.ZipFile(target, "w") as archive:
+        archive.writestr(
+            "project.xml",
+            "<Project><Setting><Name>frameRate</Name></Setting><Broken",
+        )
+
+    outline = _xml_outline(target, "project.xml")
+
+    assert "Project" in outline["tags"]
+    assert outline["tags"]["Name"]["text"] == ["frameRate"]
+    assert "error" in outline
+
+
+def test_event_budget_marks_truncation(tmp_path, monkeypatch):
     import rps.doctor.probe as probe
 
     target = tmp_path / "big.drp"
     with zipfile.ZipFile(target, "w") as archive:
         archive.writestr(
             "project.xml",
-            '<Project name="x">' + '<Setting name="a" value="b"/>' * 2000 + "</Project>",
+            "<Project>" + "<Setting name='a' value='b'/>" * 2000 + "</Project>",
         )
-    monkeypatch.setattr(probe, "OUTLINE_BYTES", 512)
+    monkeypatch.setattr(probe, "OUTLINE_EVENT_BUDGET", 40)
 
     outline = _xml_outline(target, "project.xml")
 
@@ -74,7 +130,7 @@ def test_members_worth_outlining_prefers_structure(tmp_path):
     chosen = _members_worth_outlining(members)
 
     assert chosen[0] == "project.xml"
-    assert sum(1 for name in chosen if name.startswith("SeqContainer/")) == 2
+    assert sum(1 for name in chosen if name.startswith("SeqContainer/")) == 3
     assert any(name.endswith("MpFolder.xml") for name in chosen)
 
 

@@ -25,6 +25,39 @@
 список элементов архива и инвентарь XML — имена тегов, имена атрибутов и по
 несколько примеров значений. Полные файлы проектов при этом никуда не уезжают.
 
+## Структура таймлайна (частично прочитана)
+
+Второй отчёт с той же машины вскрыл содержимое `SeqContainer/<uuid>.xml`. Это
+сериализованная объектная модель, где **значения лежат в тексте элементов**, а
+атрибут только один — `DbId`:
+
+```
+Sm2SequenceContainer  DbId = идентификатор таймлайна
+├─ VideoTrackVec / AudioTrackVec / SubtitleTrackVec / GeometryTrackVec
+│  └─ Element
+│     └─ Sm2TiTrack  DbId
+│        ├─ Type, SubType, Flags, UserDefinedName
+│        └─ Items
+│           └─ Element
+│              └─ Sm2TiVideoClip | Sm2TiAudioClip   DbId
+│                 ├─ Name              имя клипа
+│                 ├─ Start, Duration, In   положение на таймлайне
+│                 ├─ MediaFilePath      путь к медиа
+│                 ├─ MediaReelNumber    Reel Name
+│                 ├─ MediaStartTime     таймкод источника
+│                 └─ MediaFrameRate, MediaRef, MediaMetadata
+└─ DbSavedTime
+```
+
+Имя таймлайна в самом `SeqContainer` не лежит — там только `DbId`. Судя по
+всему, соответствие «имя → DbId» хранится в
+`MediaPool/Master/000_Timelines/MpFolder.xml`. Это **предположение**, которое
+проверяется первым же настоящим файлом, а не закладывается в код заранее.
+
+Осталось выяснить: единицы `Start`/`MediaStartTime` (кадры или тики), как
+дорожка нумеруется в `V1`/`V2`, и как `MediaRef` связывает клип таймлайна с
+элементом медиапула.
+
 ### Побочный вывод: расширение .drp занято не только Resolve
 
 Из 125 найденных файлов `.drp` проектами Resolve оказались около семидесяти.

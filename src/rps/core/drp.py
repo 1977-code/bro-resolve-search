@@ -44,6 +44,7 @@ __all__ = [
     "DrpKind",
     "RESOLVE_MEMBER_HINTS",
     "classify",
+    "decode_member_name",
     "list_members",
     "project_display_name",
 ]
@@ -127,6 +128,24 @@ def list_members(path: Path, limit: int = 200) -> list[tuple[str, int, int]]:
             ]
     except (zipfile.BadZipFile, OSError):
         return []
+
+
+def decode_member_name(name: str) -> str:
+    """Recover a ZIP member name that Resolve wrote as UTF-8 without saying so.
+
+    A ZIP entry only counts as UTF-8 when bit 11 of its flags is set; otherwise
+    the spec says CP437 and ``zipfile`` obeys. Resolve writes UTF-8 bytes and
+    leaves the flag clear, so a folder called ``2025.03.07 к 8 марта`` arrives
+    as ``2025.03.07 ╨║ 8 ╨╝╨░╤Ç╤é╨░``. Re-encoding through CP437 undoes it.
+
+    Only applied when the round-trip succeeds — a genuinely CP437 name is left
+    exactly as it was.
+    """
+
+    try:
+        return name.encode("cp437").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return name
 
 
 def project_display_name(path: Path) -> str:

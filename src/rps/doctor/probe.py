@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from rps import __version__
-from rps.core.drp import DrpKind, classify, list_members
+from rps.core.drp import DrpKind, classify, decode_member_name, list_members
 from rps.core.formats import detect_container
 from rps.core.matcher import extract_runs
 from rps.core.models import ContainerKind
@@ -1012,12 +1012,15 @@ def _describe_drp(path: Path) -> Finding:
     )
 
 
-OUTLINE_MEMBER_LIMIT = 4
+OUTLINE_MEMBER_LIMIT = 5
 """How many XML members to outline per project. Enough to cover project.xml,
 the media pool root and a couple of timelines."""
 
-OUTLINE_BYTES = 3 << 20
-OUTLINE_MAX_TAGS = 120
+OUTLINE_EVENT_BUDGET = 400_000
+"""Cap on parsed events per member. A forty-minute timeline is described long
+before this, and a pathological file cannot hang the diagnostic."""
+
+OUTLINE_MAX_TAGS = 200
 OUTLINE_SAMPLES = 3
 OUTLINE_VALUE_CHARS = 120
 
@@ -1055,7 +1058,12 @@ def _describe_zip_project(path: Path, size: int, head: bytes) -> Finding:
             "container": "zip",
             "magic_hex": head[:16].hex(" "),
             "members": [
-                {"name": name, "compressed": comp, "size": full}
+                {
+                    "name": name,
+                    "name_readable": decode_member_name(name),
+                    "compressed": comp,
+                    "size": full,
+                }
                 for name, comp, full in members
             ],
             "xml_outline": outlines,
@@ -1079,7 +1087,7 @@ def _members_worth_outlining(members: list[tuple[str, int, int]]) -> list[str]:
         (n for n in names if n.lower().startswith("seqcontainer/") and n.lower().endswith(".xml")),
         key=lambda n: -sizes.get(n, 0),
     )
-    chosen += timelines[:2]
+    chosen += timelines[:3]
 
     for name in names:
         if name.lower().endswith("mpfolder.xml"):
@@ -1090,46 +1098,125 @@ def _members_worth_outlining(members: list[tuple[str, int, int]]) -> list[str]:
 
 
 def _xml_outline(path: Path, member: str) -> dict[str, Any]:
-    """Element and attribute inventory of one XML member.
+    """Element, attribute and text inventory of one XML member.
 
-    The member is read up to a cap and parsed incrementally, so a truncated tail
-    yields a partial outline instead of an exception — a partial map of the
-    format is still a map.
+    Two things this has to get right, both learned the hard way from a real
+    report where almost every member came back with zero tags:
+
+    * **Element text matters more than attributes.** Resolve serialises its
+      object model as ``<MediaFilePath>D:\\...\\clip.mp4</MediaFilePath>`` —
+      only ``DbId`` is an attribute. An inventory of attributes alone describes
+      almost nothing.
+    * **A parse error must not discard what was already parsed.** Draining the
+      event queue with ``list()`` throws away every event when the last one
+      raises, which turned "the tail is malformed" into "this file has no
+      structure at all".
+
+    The member is streamed rather than read whole, so a 40 MB timeline is
+    described without being held in memory.
     """
 
     import xml.etree.ElementTree as ET  # noqa: PLC0415 — only needed here
 
+    tags: dict[str, dict[str, Any]] = {}
+    state = {"events": 0, "budget_hit": False}
+    error: str | None = None
+    read = 0
+
+    parser = ET.XMLPullParser(["start", "end"])
     try:
         with zipfile.ZipFile(path) as archive, archive.open(member) as stream:
-            data = stream.read(OUTLINE_BYTES)
-    except (zipfile.BadZipFile, OSError, KeyError):
-        return {}
+            while True:
+                chunk = stream.read(1 << 20)
+                if not chunk:
+                    break
+                read += len(chunk)
+                try:
+                    parser.feed(chunk)
+                except ET.ParseError as exc:
+                    error = f"XML оборвался: {exc}"
+                    break
+                error = _drain_events(parser, tags, state)
+                if error is not None or state["budget_hit"]:
+                    break
+    except (zipfile.BadZipFile, OSError, KeyError) as exc:
+        return {"error": f"элемент не открылся: {exc}", "bytes_read": read}
 
-    tags: dict[str, dict[str, Any]] = {}
-    truncated = len(data) >= OUTLINE_BYTES
+    if error is None and not state["budget_hit"]:
+        error = _drain_events(parser, tags, state)
+    if error is None and not state["budget_hit"]:
+        error = _close_parser(parser, tags, state)
 
-    parser = ET.XMLPullParser(["start"])
+    outline: dict[str, Any] = {
+        "tags": tags,
+        "truncated": state["budget_hit"],
+        "bytes_read": read,
+    }
+    if error is not None:
+        # Reported alongside the tags, not instead of them: a partial map of an
+        # undocumented format is still a map.
+        outline["error"] = error
+    return outline
+
+
+def _close_parser(parser: Any, tags: dict[str, dict[str, Any]], state: dict[str, Any]) -> str | None:
+    """Finish the document and report an unterminated one.
+
+    A member that simply stops mid-document raises nothing while it is being
+    fed — incomplete is not malformed. Only closing tells the difference, and
+    that difference is worth reporting: it says the outline is partial.
+    """
+
+    import xml.etree.ElementTree as ET  # noqa: PLC0415
+
     try:
-        parser.feed(data)
-    except ET.ParseError:
-        return {"error": "не разобрался как XML", "truncated": truncated}
+        parser.close()
+    except ET.ParseError as exc:
+        _drain_events(parser, tags, state)
+        return f"документ не завершён: {exc}"
+    return _drain_events(parser, tags, state)
 
-    try:
-        events = list(parser.read_events())
-    except ET.ParseError:
-        events = []
 
-    for _event, element in events:
-        entry = tags.setdefault(element.tag, {"count": 0, "attrs": {}})
-        entry["count"] += 1
-        for name, value in element.attrib.items():
-            samples = entry["attrs"].setdefault(name, [])
-            if len(samples) < OUTLINE_SAMPLES and value:
-                samples.append(value[:OUTLINE_VALUE_CHARS])
-        if len(tags) >= OUTLINE_MAX_TAGS:
-            break
+def _drain_events(parser: Any, tags: dict[str, dict[str, Any]], state: dict[str, Any]) -> str | None:
+    """Fold pending events into *tags*. Returns a parse error, if one surfaced."""
 
-    return {"tags": tags, "truncated": truncated, "bytes_read": len(data)}
+    import xml.etree.ElementTree as ET  # noqa: PLC0415
+
+    events = iter(parser.read_events())
+    while True:
+        try:
+            event, element = next(events)
+        except StopIteration:
+            return None
+        except ET.ParseError as exc:
+            return f"XML оборвался: {exc}"
+
+        state["events"] += 1
+        if state["events"] > OUTLINE_EVENT_BUDGET:
+            state["budget_hit"] = True
+            return None
+
+        entry = tags.get(element.tag)
+        if entry is None:
+            if len(tags) >= OUTLINE_MAX_TAGS:
+                continue
+            entry = tags.setdefault(
+                element.tag, {"count": 0, "attrs": {}, "text": []}
+            )
+
+        if event == "start":
+            entry["count"] += 1
+            for name, value in element.attrib.items():
+                samples = entry["attrs"].setdefault(name, [])
+                if len(samples) < OUTLINE_SAMPLES and value:
+                    samples.append(value[:OUTLINE_VALUE_CHARS])
+            continue
+
+        text = (element.text or "").strip()
+        if text and len(entry["text"]) < OUTLINE_SAMPLES:
+            entry["text"].append(text[:OUTLINE_VALUE_CHARS])
+        element.clear()
+    return None
 
 
 def _readable_ratio(run: str) -> float:

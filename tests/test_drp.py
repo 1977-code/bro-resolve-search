@@ -127,3 +127,23 @@ def test_plain_project_keeps_its_own_name(tmp_path):
     target.touch()
 
     assert project_display_name(target) == "LUGANG vs UB"
+
+
+def test_utf8_member_name_without_the_flag_is_recovered():
+    """Resolve writes UTF-8 member names but leaves the UTF-8 flag clear.
+
+    zipfile then follows the spec and decodes them as CP437, so a bin called
+    "2025.03.07 к 8 марта" arrives as mojibake.
+    """
+
+    from rps.core.drp import decode_member_name
+
+    mangled = "2025.03.07 к 8 марта".encode("utf-8").decode("cp437")
+
+    assert decode_member_name(mangled) == "2025.03.07 к 8 марта"
+
+
+def test_ascii_member_name_is_untouched():
+    from rps.core.drp import decode_member_name
+
+    assert decode_member_name("MediaPool/Master/MpFolder.xml") == "MediaPool/Master/MpFolder.xml"
