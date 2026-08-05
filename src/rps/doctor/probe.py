@@ -16,13 +16,16 @@ import string
 import subprocess
 import sys
 import time
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from rps import __version__
+from rps.core.drp import DrpKind, classify, list_members
 from rps.core.formats import detect_container
 from rps.core.matcher import extract_runs
+from rps.core.models import ContainerKind
 from rps.doctor.model import Finding, Report, Section, Status
 
 __all__ = ["collect", "ScanLimits"]
@@ -432,12 +435,36 @@ def _import_stub(stub: Path, libs: list[str], section: Section) -> Any:
             "import",
             "Импорт модуля",
             Status.FAILED,
-            f"{type(exc).__name__}: {exc}",
+            f"{type(exc).__name__}: {exc}{_explain_import_failure(exc)}",
+            data={
+                "python": platform.python_version(),
+                "frozen": bool(getattr(sys, "frozen", False)),
+            },
         )
         return None
 
     section.add("import", "Импорт модуля", Status.OK, "DaVinciResolveScript импортирован")
     return module
+
+
+def _explain_import_failure(exc: BaseException) -> str:
+    """Name the likely cause when the native module refuses to initialise.
+
+    ``fusionscript`` is a C extension compiled against one specific CPython ABI.
+    Loading it from an interpreter of a different version fails with exactly
+    this message and no further detail, which reads like a broken install when
+    it is only a version mismatch.
+    """
+
+    text = str(exc)
+    if "initialization of fusionscript failed" not in text:
+        return ""
+    return (
+        f" — почти наверняка несовпадение версий Python: библиотека собрана под "
+        f"конкретную версию, а этот процесс работает на {platform.python_version()}"
+        + (" (внутри собранного .exe)" if getattr(sys, "frozen", False) else "")
+        + ". Установка Resolve при этом исправна."
+    )
 
 
 # ------------------------------------------------------ capability matrix
@@ -820,7 +847,20 @@ def _collect_drp_files(report: Report, limits: ScanLimits, progress: Progress) -
             found.append(path)
         scanned_dirs += 1
 
-    by_folder = collections.Counter(str(p.parent) for p in found)
+    progress("Отделяю проекты Resolve от чужих файлов…")
+    projects: list[Path] = []
+    foreign: list[dict[str, str]] = []
+    unknown: list[str] = []
+    for path in found:
+        kind, reason = classify(path)
+        if kind is DrpKind.RESOLVE:
+            projects.append(path)
+        elif kind is DrpKind.FOREIGN:
+            foreign.append({"path": str(path), "reason": reason})
+        else:
+            unknown.append(str(path))
+
+    by_folder = collections.Counter(str(p.parent) for p in projects)
     caveats = []
     if len(found) >= limits.max_files:
         caveats.append(f"достигнут предел в {limits.max_files} файлов")
@@ -837,23 +877,54 @@ def _collect_drp_files(report: Report, limits: ScanLimits, progress: Progress) -
             "truncated": bool(caveats),
         },
     )
+    section.add(
+        "kinds",
+        "Из них настоящих проектов",
+        Status.OK if projects else Status.MISSING,
+        f"проектов Resolve — {len(projects)}, чужих файлов с тем же расширением — "
+        f"{len(foreign)}, неопознанных — {len(unknown)}",
+        data={
+            "resolve": [str(p) for p in projects[:500]],
+            "foreign": foreign[:200],
+            "unknown": unknown[:200],
+        },
+    )
+    if foreign:
+        section.notes.append(
+            "Расширение .drp занято не только Resolve — его используют модели "
+            "VideoProc AI и наборы ударных Reason. Поиск такие файлы пропускает, "
+            "но считает и показывает, а не выкидывает молча."
+        )
+
     if by_folder:
         top = by_folder.most_common(15)
         section.add(
             "folders",
-            "Где они лежат",
+            "Где лежат проекты",
             Status.INFO,
             "; ".join(f"{folder} — {count}" for folder, count in top),
             data=dict(by_folder),
         )
-    else:
+    if not found:
         section.notes.append(
             "Ни одного .drp не найдено. Это ожидаемо, если проекты никогда не "
             "экспортировали вручную: обычно они хранятся в базе Resolve, а не "
             "файлами на диске. В этом случае поиск по папке с .drp работать не "
             "будет, и основным режимом должен стать поиск по базе."
         )
-    return found
+    # Format analysis only ever sees real projects: the previous report spent
+    # its whole sample budget on 100 MB AI models that merely share the suffix.
+    return _prioritise(projects, by_folder)
+
+
+def _prioritise(projects: list[Path], by_folder: collections.Counter[str]) -> list[Path]:
+    """Projects from the busiest folders first.
+
+    The folder holding sixty exports is the one the editor actually works in;
+    a single stray project in Downloads says much less about the format.
+    """
+
+    return sorted(projects, key=lambda p: (-by_folder[str(p.parent)], str(p)))
 
 
 def _walk_for_drp(root: Path, deadline: float, budget: int) -> Iterator[Path]:
@@ -907,6 +978,9 @@ def _describe_drp(path: Path) -> Finding:
         )
 
     kind = detect_container(head)
+    if kind is ContainerKind.ZIP:
+        return _describe_zip_project(path, size, head)
+
     counts = {"utf-8": 0, "utf-16-le": 0}
     samples: list[str] = []
     for codec in counts:
@@ -936,6 +1010,126 @@ def _describe_drp(path: Path) -> Finding:
             "samples": samples,
         },
     )
+
+
+OUTLINE_MEMBER_LIMIT = 4
+"""How many XML members to outline per project. Enough to cover project.xml,
+the media pool root and a couple of timelines."""
+
+OUTLINE_BYTES = 3 << 20
+OUTLINE_MAX_TAGS = 120
+OUTLINE_SAMPLES = 3
+OUTLINE_VALUE_CHARS = 120
+
+
+def _describe_zip_project(path: Path, size: int, head: bytes) -> Finding:
+    """Describe a project the way a parser author needs to see it.
+
+    For a ZIP container, hunting printable runs in the compressed bytes returns
+    noise — the first report was full of it. What is worth reporting is the
+    member list and the shape of the XML inside: element names, attribute names
+    and a few sample values. That is exactly what version 2.0 gets written from,
+    and it leaks far less than shipping whole project files around.
+    """
+
+    members = list_members(path, limit=400)
+    outlines: dict[str, Any] = {}
+    for member in _members_worth_outlining(members):
+        outline = _xml_outline(path, member)
+        if outline:
+            outlines[member] = outline
+
+    tag_total = sum(len(o.get("tags", {})) for o in outlines.values())
+    detail = (
+        f"{size} байт, ZIP из {len(members)} элементов; "
+        f"разобрано XML: {len(outlines)}, различных тегов: {tag_total}"
+    )
+    return Finding(
+        key=f"drp_{path.name}",
+        label=path.name,
+        status=Status.OK,
+        detail=detail,
+        data={
+            "path": str(path),
+            "size": size,
+            "container": "zip",
+            "magic_hex": head[:16].hex(" "),
+            "members": [
+                {"name": name, "compressed": comp, "size": full}
+                for name, comp, full in members
+            ],
+            "xml_outline": outlines,
+        },
+    )
+
+
+def _members_worth_outlining(members: list[tuple[str, int, int]]) -> list[str]:
+    """Pick the members that describe structure, biggest timeline first."""
+
+    names = [name for name, _c, _u in members]
+    sizes = {name: full for name, _c, full in members}
+    chosen: list[str] = []
+
+    for name in names:
+        if name.lower() == "project.xml":
+            chosen.append(name)
+            break
+
+    timelines = sorted(
+        (n for n in names if n.lower().startswith("seqcontainer/") and n.lower().endswith(".xml")),
+        key=lambda n: -sizes.get(n, 0),
+    )
+    chosen += timelines[:2]
+
+    for name in names:
+        if name.lower().endswith("mpfolder.xml"):
+            chosen.append(name)
+            break
+
+    return chosen[:OUTLINE_MEMBER_LIMIT]
+
+
+def _xml_outline(path: Path, member: str) -> dict[str, Any]:
+    """Element and attribute inventory of one XML member.
+
+    The member is read up to a cap and parsed incrementally, so a truncated tail
+    yields a partial outline instead of an exception — a partial map of the
+    format is still a map.
+    """
+
+    import xml.etree.ElementTree as ET  # noqa: PLC0415 — only needed here
+
+    try:
+        with zipfile.ZipFile(path) as archive, archive.open(member) as stream:
+            data = stream.read(OUTLINE_BYTES)
+    except (zipfile.BadZipFile, OSError, KeyError):
+        return {}
+
+    tags: dict[str, dict[str, Any]] = {}
+    truncated = len(data) >= OUTLINE_BYTES
+
+    parser = ET.XMLPullParser(["start"])
+    try:
+        parser.feed(data)
+    except ET.ParseError:
+        return {"error": "не разобрался как XML", "truncated": truncated}
+
+    try:
+        events = list(parser.read_events())
+    except ET.ParseError:
+        events = []
+
+    for _event, element in events:
+        entry = tags.setdefault(element.tag, {"count": 0, "attrs": {}})
+        entry["count"] += 1
+        for name, value in element.attrib.items():
+            samples = entry["attrs"].setdefault(name, [])
+            if len(samples) < OUTLINE_SAMPLES and value:
+                samples.append(value[:OUTLINE_VALUE_CHARS])
+        if len(tags) >= OUTLINE_MAX_TAGS:
+            break
+
+    return {"tags": tags, "truncated": truncated, "bytes_read": len(data)}
 
 
 def _readable_ratio(run: str) -> float:

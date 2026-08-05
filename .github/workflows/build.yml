@@ -36,9 +36,14 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      # 3.11 on purpose. Resolve ships fusionscript as a C extension built
+      # against one CPython ABI; a 3.12 build could not import it at all on the
+      # first real machine we tried ("initialization of fusionscript failed").
+      # 3.11 is the newest version with a realistic chance of loading it, and
+      # the diagnostic reports plainly if it still cannot.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
           cache: pip
       - name: Install
         run: |

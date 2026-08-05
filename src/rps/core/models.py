@@ -80,6 +80,10 @@ class FileResult:
     path: Path
     size: int
     container: ContainerKind | None = None
+    kind: str = "unknown"
+    """What the file turned out to be — see :class:`rps.core.drp.DrpKind`."""
+
+    kind_reason: str = ""
     hits: list[Hit] = field(default_factory=list)
     error: str | None = None
     """Set when the file could not be read or decoded. Distinct from "no hits"."""
@@ -116,6 +120,11 @@ class ScanSummary:
     abandoned_files: int = 0
     """Files dropped part-way through by Stop. Not a fault of the file, and
     reporting them as unreadable would be a lie the user acts on."""
+
+    foreign_files: int = 0
+    """Files skipped because they are something else that shares the ``.drp``
+    extension — AI models, Reason drum kits. Counted and reported, never
+    silently dropped."""
 
     bytes_read: int = 0
     duration_s: float = 0.0

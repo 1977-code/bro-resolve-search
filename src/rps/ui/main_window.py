@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from rps import APP_NAME, __version__
 from rps.config import Settings, load_settings, save_settings
+from rps.core.drp import project_display_name
 from rps.core.export import write_csv
 from rps.core.matcher import Query
 from rps.core.models import FileResult, ScanSummary
@@ -404,7 +405,9 @@ def _human_size(size: int) -> str:
 
 def _build_item(result: FileResult) -> QTreeWidgetItem:
     if result.error:
-        item = _ResultItem([result.path.name, "—", _human_size(result.size), result.error])
+        item = _ResultItem(
+            [project_display_name(result.path), "—", _human_size(result.size), result.error]
+        )
         item.setForeground(3, QColor(DANGER))
         item.setData(0, _RESULT_ROLE, result)
         # Errors sort below every match but above nothing else.
@@ -414,7 +417,7 @@ def _build_item(result: FileResult) -> QTreeWidgetItem:
 
     item = _ResultItem(
         [
-            result.path.name,
+            project_display_name(result.path),
             str(len(result.hits)),
             _human_size(result.size),
             str(result.path.parent),
@@ -450,6 +453,8 @@ def _summarise(summary: ScanSummary, shown: int) -> str:
         line += f" Совпадения в {summary.matched_files}."
     elif not summary.cancelled:
         line += " Совпадений нет."
+    if summary.foreign_files:
+        line += f" Пропущено чужих файлов .drp: {summary.foreign_files}."
     if summary.failed_files:
         line += f" Не удалось прочитать: {summary.failed_files}."
     if summary.unfinished_files:

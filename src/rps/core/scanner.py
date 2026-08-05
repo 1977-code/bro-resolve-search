@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
 
+from rps.core.drp import DrpKind, classify
 from rps.core.formats import detect_container, iter_streams
 from rps.core.matcher import Query, search_stream
 from rps.core.models import ContainerKind, FileResult, Hit, ScanSummary
@@ -54,6 +55,13 @@ class ScanOptions:
     """0 selects a default from the CPU count."""
 
     follow_symlinks: bool = False
+
+    skip_foreign: bool = True
+    """Skip files that are positively identified as *not* Resolve projects.
+
+    Only the positively identified are skipped; anything unrecognised is still
+    searched, because an older Resolve version may have written a container this
+    code has never seen."""
 
     def worker_count(self) -> int:
         if self.workers > 0:
@@ -134,6 +142,7 @@ def scan_file(
     query: Query,
     max_hits: int = 20,
     cancel: threading.Event | None = None,
+    skip_foreign: bool = True,
 ) -> FileResult:
     """Search a single file. Never raises for an unreadable file — records it."""
 
@@ -143,6 +152,15 @@ def scan_file(
         result.size = path.stat().st_size
     except OSError:
         result.size = 0
+
+    kind, reason = classify(path)
+    result.kind = kind.value
+    result.kind_reason = reason
+    if skip_foreign and kind is DrpKind.FOREIGN:
+        # A 100 MB neural-network model that happens to end in .drp costs more
+        # to read than every real project in the folder put together.
+        result.duration_s = time.perf_counter() - started
+        return result
 
     try:
         with path.open("rb") as handle:
@@ -218,6 +236,8 @@ def scan(
         summary.bytes_read += result.size
         if result.error == CANCELLED_ERROR:
             summary.abandoned_files += 1
+        elif result.kind == DrpKind.FOREIGN.value and options.skip_foreign:
+            summary.foreign_files += 1
         else:
             summary.scanned_files += 1
             if result.error:
@@ -233,7 +253,14 @@ def scan(
         futures = set()
         for path in pending:
             futures.add(
-                pool.submit(scan_file, path, options.query, options.max_hits_per_file, cancel)
+                pool.submit(
+                    scan_file,
+                    path,
+                    options.query,
+                    options.max_hits_per_file,
+                    cancel,
+                    options.skip_foreign,
+                )
             )
             if len(futures) < max_inflight:
                 continue

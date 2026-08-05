@@ -11,6 +11,7 @@ import csv
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from rps.core.drp import project_display_name
 from rps.core.models import FileResult
 
 __all__ = ["CSV_COLUMNS", "write_csv"]
@@ -50,7 +51,7 @@ def write_csv(
             if not result.matched and not result.error and not include_misses:
                 continue
             base = [
-                result.path.stem,
+                project_display_name(result.path),
                 str(result.path),
                 str(result.path.parent),
                 result.size,
