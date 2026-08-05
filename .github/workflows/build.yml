@@ -1,0 +1,95 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install
+        run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+      - name: Test
+        run: pytest -q
+
+  windows-exe:
+    name: Windows .exe
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" pyinstaller
+
+      # Both tools ship together on purpose: the diagnostic is useless without
+      # the searcher it feeds, and the searcher is unfinished without the facts
+      # the diagnostic collects.
+      - name: Build searcher
+        run: pyinstaller --noconfirm build/resolve-project-search.spec
+      - name: Build doctor
+        run: pyinstaller --noconfirm build/resolve-doctor.spec
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          # The GUI cannot be launched on a headless runner, but the console
+          # paths exercise argument parsing, imports and the frozen bundle —
+          # which is where a broken PyInstaller build actually fails.
+          .\dist\ResolveProjectSearch.exe --help
+          New-Item -ItemType Directory -Force -Path smoke | Out-Null
+          Set-Content -Path smoke\demo.drp -Value '<Project><Clip path="D:\F\C6343.MP4"/></Project>'
+          .\dist\ResolveProjectSearch.exe smoke C6343.MP4
+          if ($LASTEXITCODE -ne 0) { throw "searcher did not find the planted clip" }
+          .\dist\ResolveDoctor.exe --help
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: |
+            dist/ResolveProjectSearch.exe
+            dist/ResolveDoctor.exe
+          if-no-files-found: error
+          retention-days: 90
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows-exe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-exe
+          path: dist
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ResolveProjectSearch.exe
+            dist/ResolveDoctor.exe
+          generate_release_notes: true
