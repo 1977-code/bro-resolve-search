@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 import threading
 import zipfile
+
+import pytest
 
 from rps.core.matcher import Query
 from rps.core.scanner import ScanOptions, discover, scan, scan_file
@@ -62,7 +65,26 @@ def test_hit_limit_stops_collecting(tmp_path):
     assert len(result.hits) == 5
 
 
-def test_unreadable_file_is_an_error_not_a_miss(tmp_path):
+def test_unopenable_path_is_an_error_not_a_miss(tmp_path):
+    """A path that cannot be opened must never be reported as "no match".
+
+    A directory is used as the stand-in because it is unopenable on every
+    platform — ``chmod(0o000)`` does not deny read access on Windows, so a
+    permission-based test would pass there while proving nothing.
+    """
+
+    target = tmp_path / "locked.drp"
+    target.mkdir()
+
+    result = scan_file(target, Query(text="C6343.MP4"))
+
+    assert result.error is not None
+    assert not result.matched
+    assert not result.readable
+
+
+@pytest.mark.skipif(os.name == "nt", reason="chmod does not deny read access on Windows")
+def test_permission_denied_is_an_error_not_a_miss(tmp_path):
     target = tmp_path / "locked.drp"
     target.write_text("C6343.MP4", encoding="utf-8")
     target.chmod(0o000)
@@ -73,7 +95,6 @@ def test_unreadable_file_is_an_error_not_a_miss(tmp_path):
 
     assert result.error is not None
     assert not result.matched
-    assert not result.readable
 
 
 def test_cancelled_scan_is_reported_as_cancelled(tmp_path):
