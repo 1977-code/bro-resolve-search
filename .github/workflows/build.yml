@@ -57,14 +57,31 @@ jobs:
         shell: pwsh
         run: |
           # The GUI cannot be launched on a headless runner, but the console
-          # paths exercise argument parsing, imports and the frozen bundle —
-          # which is where a broken PyInstaller build actually fails.
-          .\dist\ResolveProjectSearch.exe --help
+          # paths exercise argument parsing, imports, the frozen bundle and —
+          # the one that actually bit us — whether Russian output survives the
+          # Windows code page. Checks look for a Traceback rather than for
+          # Cyrillic, so the test cannot itself fail on an encoding quirk.
+          function Assert-Clean($output, $what) {
+            if ($output -match "Traceback|UnicodeEncodeError") {
+              throw "$what crashed:`n$output"
+            }
+          }
+
+          $help = (.\dist\ResolveProjectSearch.exe --help 2>&1 | Out-String)
+          Assert-Clean $help "searcher --help"
+          if ($help.Trim().Length -eq 0) { throw "searcher --help printed nothing" }
+
           New-Item -ItemType Directory -Force -Path smoke | Out-Null
           Set-Content -Path smoke\demo.drp -Value '<Project><Clip path="D:\F\C6343.MP4"/></Project>'
-          .\dist\ResolveProjectSearch.exe smoke C6343.MP4
-          if ($LASTEXITCODE -ne 0) { throw "searcher did not find the planted clip" }
-          .\dist\ResolveDoctor.exe --help
+
+          $found = (.\dist\ResolveProjectSearch.exe smoke C6343.MP4 --verbose 2>&1 | Out-String)
+          Assert-Clean $found "searcher"
+          if ($LASTEXITCODE -ne 0) { throw "searcher did not find the planted clip:`n$found" }
+          if ($found -notmatch "demo\.drp") { throw "searcher printed no path:`n$found" }
+
+          $doctor = (.\dist\ResolveDoctor.exe --help 2>&1 | Out-String)
+          Assert-Clean $doctor "doctor --help"
+          if ($doctor.Trim().Length -eq 0) { throw "doctor --help printed nothing" }
 
       - uses: actions/upload-artifact@v4
         with:

@@ -72,6 +72,10 @@ _POSIX_PATH = re.compile(r"(?:/[^\s\"'<>|/]{1,}){2,}")
 
 
 def main(argv: list[str] | None = None) -> int:
+    from rps.console import attach_console
+
+    attach_console()
+
     parser = argparse.ArgumentParser(
         prog="rps-probe",
         description="Собрать отчёт о структуре файлов .drp.",
